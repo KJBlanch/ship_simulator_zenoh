@@ -1,0 +1,30 @@
+version: "3.9"
+
+services:
+
+  sim:
+    build: .
+    network_mode: "host"
+    environment:
+      - DISPLAY=${DISPLAY}
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix  # X11 socket
+    command: ["python3", "/app/ship_sim.py"]
+
+  monitor:
+    build: .
+    network_mode: "host"
+    environment:
+      - DISPLAY=${DISPLAY}
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix
+    command: ["python3", "/app/ship_monitor.py"]
+
+  controller:
+    build: .
+    network_mode: "host"
+    environment:
+      - DISPLAY=${DISPLAY}
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix
+    command: ["python3", "/app/ship_controller.py", "cog", "270"]

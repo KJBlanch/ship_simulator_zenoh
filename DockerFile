@@ -1,0 +1,21 @@
+# Use Python 3.13 base image
+FROM python:3.13-slim
+
+# Ensure system packages are up to date
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        python3-tk \
+        libx11-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies
+RUN pip install --no-cache-dir \
+        zenoh \
+        keelson \
+        matplotlib
+
+# Copy project files
+WORKDIR /app
+COPY src/ .
+
+# No CMD or ENTRYPOINT — docker-compose will run the scripts
