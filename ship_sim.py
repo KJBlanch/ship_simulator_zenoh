@@ -3,6 +3,7 @@ import math
 import random
 import sys
 import time
+import tokenize
 
 import matplotlib.pyplot as plt
 import zenoh as Zenoh
@@ -10,12 +11,15 @@ from zenoh import Session, Config
 
 # Keelson imports
 import keelson
-from keelson import enclose, construct_pubsub_key
+from keelson import uncover, enclose, construct_pubsub_key
+
+
 from keelson.payloads.Primitives_pb2 import (
     TimestampedFloat,
     TimestampedInt,
     TimestampedString,
 )
+
 from keelson.payloads.foxglove.LocationFix_pb2 import LocationFix
 from keelson.payloads.VesselNavStatus_pb2 import VesselNavStatus
 from keelson.payloads.ROCStatus_pb2 import ROCStatus
@@ -352,10 +356,20 @@ class Ship:
             lambda sample: self._update_gates(sample.payload),
         )
 
+    def _decode(self, sample, cls):
+        try:
+            _, _, payload = uncover(sample.payload.to_bytes())
+            return cls.FromString(payload)
+        except Exception as e:
+            print(f"[WARN] Decode failed for {cls.__name__}: {e}")
+            return None
+
     def _update_cog(self, payload):
         print("Caught COG update")
         try:
-            self.cog_deg = float(payload.to_string())
+            msg = self._decode(payload, TimestampedFloat)
+            if msg:
+                self.cog_deg = msg.value
             print("Updating COG to:", self.cog_deg)
         except Exception:
             pass
@@ -365,7 +379,9 @@ class Ship:
         if self.state == "no-go":
             return
         try:
-            self.sog_knots = max(0.0, float(payload.to_string()))
+            msg = self._decode(payload, TimestampedFloat)
+            if msg:
+                self.sog_knots = msg.value
             print("Updating SOG to:", self.sog_knots)
         except Exception:
             pass
@@ -380,9 +396,19 @@ class Ship:
             pass
 
     def _update_gates(self, payload):
-        print("New gate update received (TODO: implement decoding)")
-        # TODO: define serialized format for SafteyGate and decode here.
-        # For now this is just a stub.
+        print("This message should fire when a checklist is complete for a specific safety gate.") #In lieu of a custom message type, we will respond 
+        try:
+            msg = payload.to_string()
+            print(msg)
+            vars = tokenize.generate_tokens(msg)
+            gateident = int(vars[0])
+            gatestatus = int(vars[1]) # Bool
+            for gate in self.gates:
+                if gate.ident == gateident:
+                    gate.active = gatestatus
+        except Exception:
+            pass
+
 
     # ------------------------------------------------------------------
     # Keelson publishing
