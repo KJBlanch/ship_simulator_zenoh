@@ -13,7 +13,6 @@ from zenoh import Session, Config
 import keelson
 from keelson import uncover, enclose, construct_pubsub_key
 
-
 from keelson.payloads.Primitives_pb2 import (
     TimestampedFloat,
     TimestampedInt,
@@ -26,7 +25,7 @@ from keelson.payloads.ROCStatus_pb2 import ROCStatus
 
 
 # ---------------------------------------------------------------------
-# Basic non-C++ struct for declaring a safety gate
+# Safety Gate
 # ---------------------------------------------------------------------
 class SafteyGate:
     def __init__(self, latitude, longitude, radius, ident=0, active=True):
@@ -38,10 +37,9 @@ class SafteyGate:
 
 
 # ---------------------------------------------------------------------
-# Ship class
+# Ship class with ROC handover support
 # ---------------------------------------------------------------------
 class Ship:
-    # Zenoh session shared among all ships (class-level singleton)
     _zenoh = None
 
     @staticmethod
@@ -64,99 +62,83 @@ class Ship:
         mmsi_number=265123000,
         imo_number=9319466,
     ):
-        # Basic identity / kinematics
+        # Basic identity
         self.name = name
         self.latitude = latitude
         self.longitude = longitude
-        self.cog_deg = cog_deg  # Course over ground in degrees
-        self.sog_knots = sog_knots  # Speed over ground in knots
+        self.cog_deg = cog_deg
+        self.sog_knots = sog_knots
         self.tonnage = tonnage
         self.length_m = length_m
         self.controller_id = controller_id
 
-        # Registrar values
         self.mmsi_number = mmsi_number
         self.imo_number = imo_number
 
-        # Navigation / ROC status
+        # Navigation status
         self.nav_status_value = VesselNavStatus.NavigationStatus.UNDER_WAY
-        # Default: one ROC entity
+
+        # ======================================================
+        # ROC CONTROL + PRIORITY + HANDOVER STATE
+        # ======================================================
+        self.priority_roc_id = f"ROC_{controller_id}"
+        self.current_roc_id = self.priority_roc_id
+
         self.roc_entities = [
-            ("bridge-autopilot", ROCStatus.ROCEntity.State.MONITORING)
+            (self.current_roc_id, ROCStatus.ROCEntity.State.MONITORING, True)
         ]
 
-        # Track course history
+        self.handover_active = False
+        self.handover_gate_id = None
+        self.handover_broadcast_sent = False
+        self.handover_relinquish_from = None
+        self.handover_takeover_from = None
+
+        self.state = "go"
+
         self.history_lat = [latitude]
         self.history_lon = [longitude]
-        self.state = "go"  # 'go' or 'no-go'
 
-        # Derived deceleration factor (simple model; larger ships slow down more slowly)
         self.decel_rate = max(0.01, min(0.5, 5000 / (self.tonnage + 1)))
 
-        # Zenoh initialization
+        # Zenoh init
         self.zenoh = Ship.init_zenoh()
         self._start_zenoh_subscribers()
 
-        # Safety-gate knowledge
+        # Safety gates
         self.safety_gates = []
 
-        # Keelson pubsub base path
         self._base_path = "rise/@v0"
 
-        # Declare Keelson publishers according to schema
-        # GNSS / kinematics
+        # ------------------------------------------------------------------
+        # Publishers
+        # ------------------------------------------------------------------
         self.pub_location_fix = self.zenoh.declare_publisher(
-            construct_pubsub_key(
-                self._base_path, self.name, "location_fix", "gnss/0"
-            )
+            construct_pubsub_key(self._base_path, self.name, "location_fix", "gnss/0")
         )
         self.pub_cog = self.zenoh.declare_publisher(
-            construct_pubsub_key(
-                self._base_path,
-                self.name,
-                "course_over_ground_deg",
-                "gnss/0",
-            )
+            construct_pubsub_key(self._base_path, self.name, "course_over_ground_deg", "gnss/0")
         )
         self.pub_sog = self.zenoh.declare_publisher(
-            construct_pubsub_key(
-                self._base_path,
-                self.name,
-                "speed_over_ground_knots",
-                "gnss/0",
-            )
+            construct_pubsub_key(self._base_path, self.name, "speed_over_ground_knots", "gnss/0")
         )
-
-        # Registrar
         self.pub_name = self.zenoh.declare_publisher(
-            construct_pubsub_key(
-                self._base_path, self.name, "name", "registrar/0"
-            )
+            construct_pubsub_key(self._base_path, self.name, "name", "registrar/0")
         )
         self.pub_mmsi = self.zenoh.declare_publisher(
-            construct_pubsub_key(
-                self._base_path, self.name, "mmsi_number", "registrar/0"
-            )
+            construct_pubsub_key(self._base_path, self.name, "mmsi_number", "registrar/0")
         )
         self.pub_imo = self.zenoh.declare_publisher(
-            construct_pubsub_key(
-                self._base_path, self.name, "imo_number", "registrar/0"
-            )
+            construct_pubsub_key(self._base_path, self.name, "imo_number", "registrar/0")
         )
-
-        # Bridge status
         self.pub_nav_status = self.zenoh.declare_publisher(
-            construct_pubsub_key(
-                self._base_path, self.name, "nav_status", "bridge/0"
-            )
+            construct_pubsub_key(self._base_path, self.name, "nav_status", "bridge/0")
         )
         self.pub_roc_status = self.zenoh.declare_publisher(
-            construct_pubsub_key(
-                self._base_path, self.name, "roc_status", "bridge/0"
-            )
+            construct_pubsub_key(self._base_path, self.name, "roc_status", "bridge/0")
         )
 
-        # Remote status / time (plain strings, no keelson encoding)
+        # Remote status
         self.pub_remote_status = self.zenoh.declare_publisher(
             f"{self._base_path}/{self.name}/pubsub/remote_status/bridge/0"
         )
@@ -164,96 +146,293 @@ class Ship:
             f"{self._base_path}/{self.name}/pubsub/remote_time/bridge/1"
         )
 
+        # NEW HANDOVER PUBLISHERS
+        self.pub_handover_request = self.zenoh.declare_publisher(
+            f"{self._base_path}/{self.name}/handover/request"
+        )
+        self.pub_handover_state = self.zenoh.declare_publisher(
+            f"{self._base_path}/{self.name}/handover/state"
+        )
+
+
     # ------------------------------------------------------------------
-    # Safety gate management
+    # Safety gate tools
     # ------------------------------------------------------------------
     def add_s_gate(self, gate: SafteyGate):
-        existing_ids = {g.ident for g in self.safety_gates}
-        while gate.ident in existing_ids:
+        ids = {g.ident for g in self.safety_gates}
+        while gate.ident in ids:
             gate.ident += 1
         self.safety_gates.append(gate)
 
     def clear_gate(self, ident):
-        for gate in self.safety_gates:
-            if gate.ident == ident:
-                gate.active = False
+        for g in self.safety_gates:
+            if g.ident == ident:
+                g.active = False
+
 
     # ------------------------------------------------------------------
-    # Navigation status helpers
+    # Zenoh Subscriber Setup
     # ------------------------------------------------------------------
-    def set_nav_status(self, status_enum):
-        """Set navigation status using VesselNavStatus.NavigationStatus enum."""
-        self.nav_status_value = status_enum
+    def _start_zenoh_subscribers(self):
+        # Legacy control
+        self.zenoh.declare_subscriber(
+            f"{self.name}/COG",
+            lambda s: self._update_cog_legacy(s.payload)
+        )
+        self.zenoh.declare_subscriber(
+            f"{self.name}/SOG",
+            lambda s: self._update_sog_legacy(s.payload)
+        )
 
-    def set_roc_entity(self, entity_id, state_enum):
-        """Update or add a ROC entity."""
-        for idx, (eid, _) in enumerate(self.roc_entities):
-            if eid == entity_id:
-                self.roc_entities[idx] = (entity_id, state_enum)
-                return
-        self.roc_entities.append((entity_id, state_enum))
+        # ROC-aware control
+        self.zenoh.declare_subscriber(
+            f"{self.name}/control/roc/*/COG",
+            self._update_cog
+        )
+        self.zenoh.declare_subscriber(
+            f"{self.name}/control/roc/*/SOG",
+            self._update_sog
+        )
+
+        # Handover events
+        self.zenoh.declare_subscriber(
+            f"{self.name}/handover/relinquish",
+            self._on_roc_relinquish
+        )
+        self.zenoh.declare_subscriber(
+            f"{self.name}/handover/takeover",
+            self._on_roc_takeover
+        )
+
 
     # ------------------------------------------------------------------
-    # State / kinematics update
+    # Decode helper
+    # ------------------------------------------------------------------
+    def _decode(self, sample, cls):
+        try:
+            _, _, payload = uncover(sample.to_bytes())
+            return cls.FromString(payload)
+        except Exception:
+            try:
+                _, _, payload = uncover(sample)
+                return cls.FromString(payload)
+            except:
+                return None
+
+
+    # ============================================================
+    # LEGACY CONTROL (treated as priority ROC)
+    # ============================================================
+    def _update_cog_legacy(self, payload):
+        msg = self._decode(payload, TimestampedFloat)
+        if msg:
+            self.cog_deg = msg.value
+
+    def _update_sog_legacy(self, payload):
+        if self.state == "no-go":
+            return
+        msg = self._decode(payload, TimestampedFloat)
+        if msg:
+            self.sog_knots = msg.value
+
+
+    # ============================================================
+    # ROC-AWARE CONTROL
+    # ============================================================
+    def _extract_roc_id_from_key(self, key_expr, suffix):
+        key = str(key_expr)
+        parts = key.split("/")
+        if len(parts) >= 2 and parts[-1] == suffix:
+            return parts[-2]
+        return None
+
+
+    def _update_cog(self, sample):
+        roc_id = self._extract_roc_id_from_key(sample.key_expr, "COG")
+        if roc_id != self.priority_roc_id:
+            print(f"[IGNORE] COG from non-priority ROC {roc_id}")
+            return
+        msg = self._decode(sample.payload, TimestampedFloat)
+        if msg:
+            self.cog_deg = msg.value
+
+
+    def _update_sog(self, sample):
+        roc_id = self._extract_roc_id_from_key(sample.key_expr, "SOG")
+        if roc_id != self.priority_roc_id:
+            print(f"[IGNORE] SOG from non-priority ROC {roc_id}")
+            return
+        if self.state == "no-go":
+            return
+        msg = self._decode(sample.payload, TimestampedFloat)
+        if msg:
+            self.sog_knots = msg.value
+
+
+    # ============================================================
+    # HANDOVER PROTOCOL IMPLEMENTATION
+    # ============================================================
+    def _on_roc_relinquish(self, sample):
+        """ROC currently in control announces readiness to relinquish."""
+        try:
+            roc_id = sample.payload.to_string().strip()
+        except:
+            print("[ERROR] Could not parse relinquish payload")
+            return
+
+        print(f"[HANDOVER] Relinquish received from {roc_id}")
+
+        if not self.handover_active:
+            print("[HANDOVER] Ignored: no active handover")
+            return
+
+        if roc_id != self.current_roc_id:
+            print(f"[HANDOVER] Ignored relinquish from non-current ROC {roc_id}")
+            return
+
+        self.handover_relinquish_from = roc_id
+        self._maybe_complete_handover()
+
+
+    def _on_roc_takeover(self, sample):
+        """ROC wanting to assume control."""
+        try:
+            roc_id = sample.payload.to_string().strip()
+        except:
+            print("[ERROR] Could not parse takeover payload")
+            return
+
+        print(f"[HANDOVER] Takeover received from {roc_id}")
+
+        if not self.handover_active:
+            print("[HANDOVER] Ignored: no active handover")
+            return
+
+        if roc_id == self.current_roc_id:
+            print("[HANDOVER] Can't takeover: ROC is already in control")
+            return
+
+        self.handover_takeover_from = roc_id
+
+        # Ensure ROC exists in registry
+        if not any(eid == roc_id for eid, _, _ in self.roc_entities):
+            self.roc_entities.append((roc_id, ROCStatus.ROCEntity.State.MONITORING, False))
+
+        self._maybe_complete_handover()
+
+
+    def _maybe_start_handover(self, tt):
+        """Trigger handover request when ship is within 15 minutes of gate."""
+        if tt is None:
+            return
+
+        gate_id, t_sec = tt
+        if t_sec <= 0:
+            return
+
+        if t_sec <= 900 and not self.handover_broadcast_sent:
+            # Activate handover state
+            self.handover_active = True
+            self.handover_gate_id = gate_id
+            self.handover_broadcast_sent = True
+
+            msg = (
+                f"READY_FOR_HANDOVER gate_id={gate_id} "
+                f"time_to_gate={t_sec:.1f} "
+                f"current_roc={self.current_roc_id}"
+            )
+
+            print(f"[HANDOVER] Broadcasting request: {msg}")
+            self.pub_handover_request.put(msg)
+
+
+    def _maybe_complete_handover(self):
+        """If relinquish + takeover have both been received, complete handover."""
+        if not self.handover_active:
+            return
+        if not self.handover_relinquish_from:
+            return
+        if not self.handover_takeover_from:
+            return
+
+        new_roc = self.handover_takeover_from
+        old_roc = self.current_roc_id
+        gate_id = self.handover_gate_id
+
+        print(f"[HANDOVER] Completing handover {old_roc} → {new_roc}")
+
+        # Flip ROC priority
+        self.priority_roc_id = new_roc
+        self.current_roc_id = new_roc
+
+        updated = []
+        for eid, st, _prio in self.roc_entities:
+            updated.append((eid, st, eid == new_roc))
+        self.roc_entities = updated
+
+        # Deactivate safety gate
+        if gate_id is not None:
+            self.clear_gate(gate_id)
+            print(f"[HANDOVER] Safety gate {gate_id} deactivated")
+
+        # Publish success
+        self.pub_handover_state.put(
+            f"HANDOVER_COMPLETED new_priority={new_roc} gate={gate_id}"
+        )
+
+        # Reset state
+        self.handover_active = False
+        self.handover_broadcast_sent = False
+        self.handover_relinquish_from = None
+        self.handover_takeover_from = None
+        self.handover_gate_id = None
+
+
+    # ------------------------------------------------------------------
+    # Kinematics & Navigation Updates
     # ------------------------------------------------------------------
     def set_state(self, new_state):
         if new_state not in ["go", "no-go"]:
-            raise ValueError("State must be 'go' or 'no-go'")
+            raise ValueError("Invalid state. Must be 'go' or 'no-go'.")
         self.state = new_state
 
-    def update_speed(self, dt):
-        """
-        If in no-go state, reduce SOG slowly toward 0.
-        dt: time delta in seconds
-        """
-        if self.state == "go":
-            return  # keep current SOG
 
-        decel_amount = self.decel_rate * dt
-        self.sog_knots = max(0.0, self.sog_knots - decel_amount)
+    def update_speed(self, dt):
+        if self.state == "go":
+            return
+        self.sog_knots = max(0.0, self.sog_knots - self.decel_rate * dt)
+
 
     def update_position(self, dt):
-        """
-        Update ship position based on COG/SOG with Earth curvature approximation.
-        dt: time delta in seconds
-        """
-        speed_mps = self.sog_knots * 0.514444  # knots → m/s
+        speed_mps = self.sog_knots * 0.514444
         distance = speed_mps * dt
+        angle = math.radians(self.cog_deg)
 
-        cog_rad = math.radians(self.cog_deg)
-        R = 6371000  # Earth radius (m)
-
-        dlat = (distance * math.cos(cog_rad)) / R
-        dlon = (distance * math.sin(cog_rad)) / (
-            R * math.cos(math.radians(self.latitude))
-        )
+        R = 6371000
+        dlat = (distance * math.cos(angle)) / R
+        dlon = (distance * math.sin(angle)) / (R * math.cos(math.radians(self.latitude)))
 
         self.latitude += math.degrees(dlat)
         self.longitude += math.degrees(dlon)
 
+
     # ------------------------------------------------------------------
-    # Safety gate checks
+    # Safety Gate Logic
     # ------------------------------------------------------------------
     def is_in_circle(self):
-        """
-        If inside any active gate, set state to 'no-go'.
-        """
-        R = 6371000  # Earth radius in meters
-
+        R = 6371000
         for gate in self.safety_gates:
             if not gate.active:
                 continue
 
             phi1 = math.radians(self.latitude)
             phi2 = math.radians(gate.latitude)
-            dphi = math.radians(gate.latitude - self.latitude)
+            dphi = phi2 - phi1
             dlambda = math.radians(gate.longitude - self.longitude)
 
             a = (
-                math.sin(dphi / 2) ** 2
-                + math.cos(phi1)
-                * math.cos(phi2)
-                * math.sin(dlambda / 2) ** 2
+                math.sin(dphi / 2)**2
+                + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2)**2
             )
             c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
             dist = R * c
@@ -261,38 +440,28 @@ class Ship:
             if dist <= gate.radius:
                 self.state = "no-go"
 
-    def time_to_circle(self):
-        R = 6371000  # meters
 
-        best_gate_id = None
-        best_time = None
+    def time_to_circle(self):
+        R = 6371000
+        best_gate = None
+        best_t = None
 
         for gate in self.safety_gates:
             if not gate.active:
                 continue
 
-            # Convert to radians
             lat1 = math.radians(self.latitude)
             lon1 = math.radians(self.longitude)
-            latc = math.radians(gate.latitude)
-            lonc = math.radians(gate.longitude)
+            lat2 = math.radians(gate.latitude)
+            lon2 = math.radians(gate.longitude)
 
-            # ENU coords
-            dlat = latc - lat1
-            dlon = lonc - lon1
-
-            north = dlat * R
-            east = dlon * R * math.cos(lat1)
-
-            dx = east
-            dy = north
-
+            dx = (lon2 - lon1) * R * math.cos(lat1)
+            dy = (lat2 - lat1) * R
             dist = math.hypot(dx, dy)
 
             if dist <= gate.radius:
-                return gate.ident, 0.0
+                return gate.ident, 0
 
-            # Velocity vector
             speed = self.sog_knots * 0.514444
             if speed <= 0:
                 continue
@@ -301,127 +470,40 @@ class Ship:
             vx = speed * math.sin(theta)
             vy = speed * math.cos(theta)
 
-            # Correct quadratic formulation
             A = vx*vx + vy*vy
             B = 2*(dx*vx + dy*vy)
             C = dx*dx + dy*dy - gate.radius*gate.radius
 
-            discriminant = B*B - 4*A*C
-            if discriminant < 0:
-                continue  # No intersection
+            D = B*B - 4*A*C
+            if D < 0:
+                continue
 
-            sqrtD = math.sqrt(discriminant)
-            t1 = (B - sqrtD) / (2*A)
-            t2 = (B + sqrtD) / (2*A)
+            t1 = (-B - math.sqrt(D)) / (2*A)
+            t2 = (-B + math.sqrt(D)) / (2*A)
 
-            print (t1, t2)
-
-            # Only positive solutions matter
             times = [t for t in (t1, t2) if t > 0]
-
             if not times:
                 continue
 
             t_hit = min(times)
+            if best_t is None or t_hit < best_t:
+                best_t = t_hit
+                best_gate = gate.ident
 
-            if best_time is None or t_hit < best_time:
-                best_time = t_hit
-                best_gate_id = gate.ident
-
-        if best_time is None:
+        if best_gate is None:
             return None
-
-        return best_gate_id, best_time
-
+        return best_gate, best_t
 
     # ------------------------------------------------------------------
-    # Zenoh subscribers for control / updates
-    # ------------------------------------------------------------------
-    def _start_zenoh_subscribers(self):
-        # These control topics are just examples; adjust to your control plane as needed.
-        self.zenoh.declare_subscriber(
-            f"{self.name}/COG",
-            lambda sample: self._update_cog(sample.payload),
-        )
-        self.zenoh.declare_subscriber(
-            f"{self.name}/SOG",
-            lambda sample: self._update_sog(sample.payload),
-        )
-        self.zenoh.declare_subscriber(
-            f"{self.name}/state",
-            lambda sample: self._update_state(sample.payload),
-        )
-        self.zenoh.declare_subscriber(
-            f"{self.name}/gates",
-            lambda sample: self._update_gates(sample.payload),
-        )
-
-    def _decode(self, sample, cls):
-        try:
-            _, _, payload = uncover(sample.payload.to_bytes())
-            return cls.FromString(payload)
-        except Exception as e:
-            print(f"[WARN] Decode failed for {cls.__name__}: {e}")
-            return None
-
-    def _update_cog(self, payload):
-        print("Caught COG update")
-        try:
-            msg = self._decode(payload, TimestampedFloat)
-            if msg:
-                self.cog_deg = msg.value
-            print("Updating COG to:", self.cog_deg)
-        except Exception:
-            pass
-
-    def _update_sog(self, payload):
-        print("Caught SOG update")
-        if self.state == "no-go":
-            return
-        try:
-            msg = self._decode(payload, TimestampedFloat)
-            if msg:
-                self.sog_knots = msg.value
-            print("Updating SOG to:", self.sog_knots)
-        except Exception:
-            pass
-
-    def _update_state(self, payload):
-        print("Caught go/no-go")
-        try:
-            new_state = payload.to_string().strip().lower()
-            if new_state in ["go", "no-go"]:
-                self.state = new_state
-        except Exception:
-            pass
-
-    def _update_gates(self, payload):
-        print("This message should fire when a checklist is complete for a specific safety gate.") #In lieu of a custom message type, we will respond 
-        try:
-            msg = payload.to_string()
-            print(msg)
-            vars = tokenize.generate_tokens(msg)
-            gateident = int(vars[0])
-            gatestatus = int(vars[1]) # Bool
-            for gate in self.gates:
-                if gate.ident == gateident:
-                    gate.active = gatestatus
-        except Exception:
-            pass
-
-
-    # ------------------------------------------------------------------
-    # Keelson publishing
+    # Publishing Ship State (Keelson message outputs)
     # ------------------------------------------------------------------
     def _publish_state(self):
-        """
-        Publish current state using Keelson well-known subjects, plus
-        remote_status/remote_time as plain strings.
-        """
         try:
             now_ns = time.time_ns()
 
-            # location_fix (foxglove.LocationFix)
+            # ------------------------------------------------------------------
+            # LocationFix (GNSS)
+            # ------------------------------------------------------------------
             loc = LocationFix()
             loc.timestamp.FromNanoseconds(now_ns)
             loc.latitude = float(self.latitude)
@@ -430,105 +512,108 @@ class Ship:
             loc.frame_id = self.name
             self.pub_location_fix.put(enclose(loc.SerializeToString()))
 
-            # course_over_ground_deg (TimestampedFloat)
+            # ------------------------------------------------------------------
+            # Course over ground
+            # ------------------------------------------------------------------
             cog_msg = TimestampedFloat()
             cog_msg.timestamp.FromNanoseconds(now_ns)
             cog_msg.value = float(self.cog_deg)
             self.pub_cog.put(enclose(cog_msg.SerializeToString()))
 
-            # speed_over_ground_knots (TimestampedFloat)
+            # ------------------------------------------------------------------
+            # Speed over ground
+            # ------------------------------------------------------------------
             sog_msg = TimestampedFloat()
             sog_msg.timestamp.FromNanoseconds(now_ns)
             sog_msg.value = float(self.sog_knots)
             self.pub_sog.put(enclose(sog_msg.SerializeToString()))
 
-            # name (TimestampedString)
+            # ------------------------------------------------------------------
+            # Registrar info
+            # ------------------------------------------------------------------
             name_msg = TimestampedString()
             name_msg.timestamp.FromNanoseconds(now_ns)
             name_msg.value = self.name
             self.pub_name.put(enclose(name_msg.SerializeToString()))
 
-            # mmsi_number (TimestampedInt)
             mmsi_msg = TimestampedInt()
             mmsi_msg.timestamp.FromNanoseconds(now_ns)
             mmsi_msg.value = int(self.mmsi_number)
             self.pub_mmsi.put(enclose(mmsi_msg.SerializeToString()))
 
-            # imo_number (TimestampedInt)
             imo_msg = TimestampedInt()
             imo_msg.timestamp.FromNanoseconds(now_ns)
             imo_msg.value = int(self.imo_number)
             self.pub_imo.put(enclose(imo_msg.SerializeToString()))
 
-            # nav_status (VesselNavStatus)
+            # ------------------------------------------------------------------
+            # Navigation status
+            # ------------------------------------------------------------------
             nav_msg = VesselNavStatus()
             nav_msg.timestamp.FromNanoseconds(now_ns)
             nav_msg.navigation_status = self.nav_status_value
             self.pub_nav_status.put(enclose(nav_msg.SerializeToString()))
 
-            # roc_status (ROCStatus)
+            # ------------------------------------------------------------------
+            # ROC status
+            # ------------------------------------------------------------------
             roc_msg = ROCStatus()
             roc_msg.timestamp.FromNanoseconds(now_ns)
-            for entity_id, state_enum in self.roc_entities:
+            for entity_id, state_enum, priority in self.roc_entities:
                 e = roc_msg.entities.add()
                 e.entity_id = entity_id
                 e.state = state_enum
+                # If you later add a has_priority field, it can be set here.
             self.pub_roc_status.put(enclose(roc_msg.SerializeToString()))
 
-            # Remote status & remote time (plain Zenoh strings)
+            # ------------------------------------------------------------------
+            # Safety gate timing + Handover start check
+            # ------------------------------------------------------------------
             tt = self.time_to_circle()
-            remote_status = None
-            remote_time_value = None
+            self._maybe_start_handover(tt)
 
+            # Human-readable remote status messages
             if tt is None:
-                remote_status = "Normal. No gates on path"
+                self.pub_remote_status.put("Normal. No gates on path")
             else:
-                gate_id, t_sec = tt
-                if t_sec <= 0:
-                    # Inside a safety gate
-                    if self.state == "no-go":
-                        remote_status = "Inside safety gate - Stopping"
-                    else:
-                        remote_status = "Inside safety gate - Passing"
-                    # No remote_time for this case
+                gate, t = tt
+                if t <= 0:
+                    msg = f"Inside safety gate {gate}"
                 else:
-                    remote_status = (
-                        f"Normal. Time to next safety gate: {t_sec:.1f}"
-                    )
-                    remote_time_value = t_sec
-
-            if remote_status is not None:
-                self.pub_remote_status.put(remote_status)
-
-            if remote_time_value is not None:
-                self.pub_remote_time.put(f"{remote_time_value}")
+                    msg = f"Time to gate {gate}: {t:.1f}s"
+                    self.pub_remote_time.put(f"{t:.1f}")
+                self.pub_remote_status.put(msg)
 
         except Exception as e:
-            print("Failure to push:", e)
+            print("[ERROR] Failed to publish:", e)
+
 
     # ------------------------------------------------------------------
-    # Simulation loop
+    # SIMULATION STEP
     # ------------------------------------------------------------------
     def step(self, dt):
-        """Perform a full update step: noise, speed, position, safety-gate logic, publish."""
-        # Add small noise to SOG and COG
-        self.sog_knots += random.gauss(0, 0.05)  # ~0.05 knot std dev
-        self.cog_deg = (self.cog_deg + random.gauss(0, 0.2)) % 360  # ~0.2° std dev
+        # Add small noise
+        self.sog_knots += random.gauss(0, 0.05)
+        self.cog_deg = (self.cog_deg + random.gauss(0, 0.2)) % 360
 
-        # Update dynamics
+        # Dynamics
         self.update_speed(dt)
         self.update_position(dt)
 
-        # Log history
+        # Append history
         self.history_lat.append(self.latitude)
         self.history_lon.append(self.longitude)
 
-        # Safety check
+        # Safety gate logic
         self.is_in_circle()
 
-        # Publish all data
+        # Publish state
         self._publish_state()
 
+
+    # ------------------------------------------------------------------
+    # High-level simulation loop
+    # ------------------------------------------------------------------
     def simulate(self, frequency_hz=1.0, duration_sec=10.0, live_plot=False):
         dt = 1.0 / frequency_hz
         steps = int(duration_sec / dt)
@@ -543,92 +628,23 @@ class Ship:
             if live_plot:
                 ax.clear()
 
-                # Plot course history
                 ax.plot(self.history_lon, self.history_lat, marker="o", linewidth=1, color="black")
 
-                # Plot safety gates
+                # Safety gates
                 for gate in self.safety_gates:
                     color = "red" if gate.active else "blue"
-
-                    # Convert radius (meters) to degrees latitude (approx)
-                    radius_deg = gate.radius / 111_320.0  # meters per degree lat
-
-                    circle = plt.Circle(
-                        (gate.longitude, gate.latitude),
-                        radius_deg,
-                        fill=False,
-                        color=color,
-                        linewidth=2,
-                        alpha=0.7,
-                    )
+                    rad_deg = gate.radius / 111320.0
+                    circle = plt.Circle((gate.longitude, gate.latitude), rad_deg,
+                                        fill=False, color=color, linewidth=2)
                     ax.add_patch(circle)
-                    ax.text(
-                        gate.longitude,
-                        gate.latitude,
-                        f"Gate {gate.ident}",
-                        fontsize=8,
-                        ha="center",
-                        va="center",
-                        color=color,
-                    )
-
-                # Build status text box
-                tt = self.time_to_circle()
-                if tt is None:
-                    remote_status = "Normal. No gates on path"
-                else:
-                    gid, tsec = tt
-                    if tsec <= 0:
-                        if self.state == "no-go":
-                            remote_status = "Inside safety gate - Stopping"
-                        else:
-                            remote_status = "Inside safety gate - Passing"
-                    else:
-                        remote_status = f"Time to next safety gate: {tsec:.1f} sec"
-
-                text = (
-                    f"Vessel: {self.name}\n"
-                    f"COG: {self.cog_deg:.1f}°\n"
-                    f"SOG: {self.sog_knots:.2f} kn\n"
-                    f"State: {self.state}\n"
-                    f"Nav Status: {self.nav_status_value}\n"
-                    f"{remote_status}"
-                )
-
-                ax.text(
-                    0.02,
-                    0.02,
-                    text,
-                    transform=ax.transAxes,
-                    fontsize=10,
-                    color="black",
-                    bbox=dict(
-                        facecolor="white",
-                        alpha=0.6,
-                        edgecolor="gray",
-                        boxstyle="round,pad=0.3",
-                    ),
-                    verticalalignment="bottom",
-                )
+                    ax.text(gate.longitude, gate.latitude, f"Gate {gate.ident}",
+                            color=color, ha="center")
 
                 ax.set_xlabel("Longitude")
                 ax.set_ylabel("Latitude")
-                ax.set_title(f"Live Course Plot for {self.name}")
+                ax.set_title(f"Live Course for {self.name}")
                 ax.grid(True)
-                ax.set_aspect("equal", "box")
-
-                # Autoscale plot so ship & gates stay visible
-                all_lats = self.history_lat + [g.latitude for g in self.safety_gates]
-                all_lons = self.history_lon + [g.longitude for g in self.safety_gates]
-
-                if all_lats:
-                    lat_min = min(all_lats)
-                    lat_max = max(all_lats)
-                    lon_min = min(all_lons)
-                    lon_max = max(all_lons)
-                    pad = 0.001
-                    ax.set_xlim(lon_min - pad, lon_max + pad)
-                    ax.set_ylim(lat_min - pad, lat_max + pad)
+                ax.set_aspect("equal")
 
                 plt.pause(0.001)
 
@@ -638,75 +654,67 @@ class Ship:
             plt.close()
 
 
+    # ------------------------------------------------------------------
+    # Plot result post-simulation
+    # ------------------------------------------------------------------
     def plot_course(self):
         plt.figure(figsize=(8, 8))
-        plt.plot(self.history_lon, self.history_lat, marker="o", linewidth=1, color="black")
+        plt.plot(self.history_lon, self.history_lat, marker="o", linewidth=1)
 
-        # Plot safety gates
         for gate in self.safety_gates:
             color = "red" if gate.active else "blue"
-            radius_deg = gate.radius / 111_320.0
-
-            circle = plt.Circle(
-                (gate.longitude, gate.latitude),
-                radius_deg,
-                fill=False,
-                color=color,
-                linewidth=2,
-                alpha=0.7,
-            )
+            rad_deg = gate.radius / 111320.0
+            circle = plt.Circle((gate.longitude, gate.latitude), rad_deg,
+                                fill=False, color=color, linewidth=2)
             plt.gca().add_patch(circle)
-            plt.text(
-                gate.longitude,
-                gate.latitude,
-                f"Gate {gate.ident}",
-                fontsize=8,
-                ha="center",
-                va="center",
-                color=color,
-            )
+            plt.text(gate.longitude, gate.latitude, f"Gate {gate.ident}",
+                     color=color, ha="center")
 
         plt.xlabel("Longitude")
         plt.ylabel("Latitude")
-        plt.title(f"Course Plot for {self.name}")
+        plt.title(f"Course for {self.name}")
         plt.grid(True)
-        plt.gca().set_aspect("equal", "box")
+        plt.gca().set_aspect("equal")
         plt.show()
 
+
+    # ------------------------------------------------------------------
+    # String representation
+    # ------------------------------------------------------------------
     def __repr__(self):
-        return (
-            f"Ship(name={self.name}, lat={self.latitude:.6f}, lon={self.longitude:.6f}, "
-            f"COG={self.cog_deg:.2f}, SOG={self.sog_knots:.2f}, state={self.state})"
-        )
+        return (f"Ship(name={self.name}, lat={self.latitude:.6f}, "
+                f"lon={self.longitude:.6f}, COG={self.cog_deg:.2f}, "
+                f"SOG={self.sog_knots:.2f}, state={self.state}, "
+                f"priority_roc={self.priority_roc_id})")
 
 
 # ---------------------------------------------------------------------
-# Main entry point
+# MAIN ENTRY POINT
 # ---------------------------------------------------------------------
 if __name__ == "__main__":
-    ship = Ship(name="MASS_0")
+    ship = Ship(name="MASS_0", controller_id=1)
 
-    # Example initial kinematics
     ship.cog_deg = 45.0
     ship.sog_knots = 15.0
 
-    # Example: add a safety gate ~1 km ahead
-    gate = SafteyGate(latitude=ship.latitude + 0.001, longitude=ship.longitude + 0.001, radius=100.0, ident=1)
+    # Add a safety gate ~1 km ahead
+    gate = SafteyGate(
+        latitude=ship.latitude + 0.001,
+        longitude=ship.longitude + 0.001,
+        radius=100.0,
+        ident=1
+    )
     ship.add_s_gate(gate)
 
     try:
         print("Starting simulation...")
         ship.simulate(frequency_hz=5, duration_sec=30, live_plot=True)
-
-        print("Final ship state:")
         print(ship)
 
         if Ship._zenoh is not None:
             Ship._zenoh.close()
-        sys.exit(0)
 
     except KeyboardInterrupt:
-        print("Interrupted, shutting down...")
+        print("Interrupted.")
         if Ship._zenoh is not None:
             Ship._zenoh.close()
-        sys.exit(0)

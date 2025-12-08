@@ -27,16 +27,3 @@ services:
       - /run/desktop/mnt/host/wslg/.X11-unix:/tmp/.X11-unix
       - /run/desktop/mnt/host/wslg:/mnt/wslg
     command: ["python3", "/app/ship_monitor.py"]
-
-  # controller:
-  #   build: .
-  #   network_mode: "host"
-  #   environment:
-      # - DISPLAY=:0
-      # - WAYLAND_DISPLAY=wayland-0
-      # - XDG_RUNTIME_DIR=/mnt/wslg/runtime-dir
-      # - PULSE_SERVER=/mnt/wslg/PulseServer
-  #   volumes:
-  #    - /run/desktop/mnt/host/wslg/.X11-unix:/tmp/.X11-unix
-  #    - /run/desktop/mnt/host/wslg:/mnt/wslg
-  #   command: ["python3", "/app/ship_controller.py", "cog", "270"]
