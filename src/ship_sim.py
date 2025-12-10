@@ -478,8 +478,8 @@ class Ship:
             if D < 0:
                 continue
 
-            t1 = (-B - math.sqrt(D)) / (2*A)
-            t2 = (-B + math.sqrt(D)) / (2*A)
+            t1 = (B - math.sqrt(D)) / (2*A)
+            t2 = (B + math.sqrt(D)) / (2*A)
 
             times = [t for t in (t1, t2) if t > 0]
             if not times:
@@ -718,3 +718,4 @@ if __name__ == "__main__":
         print("Interrupted.")
         if Ship._zenoh is not None:
             Ship._zenoh.close()
+
