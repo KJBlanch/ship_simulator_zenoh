@@ -13,7 +13,7 @@ services:
     volumes:
       - /run/desktop/mnt/host/wslg/.X11-unix:/tmp/.X11-unix
       - /run/desktop/mnt/host/wslg:/mnt/wslg
-    command: ["python3", "/app/ship_sim.py"]
+    command: ["python3", "/app/ship_sim.py", "-m" , "client", "--connect", "tcp/10.10.7.2.7448"]
 
   monitor:
     build: .

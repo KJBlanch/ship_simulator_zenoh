@@ -4,6 +4,8 @@ import random
 import sys
 import time
 import tokenize
+import argparse
+import logging
 
 import matplotlib.pyplot as plt
 import zenoh as Zenoh
@@ -41,16 +43,21 @@ class SafteyGate:
 # ---------------------------------------------------------------------
 class Ship:
     _zenoh = None
+    conf = None
 
     @staticmethod
     def init_zenoh():
-        if Ship._zenoh is None:
+        if Ship._zenoh is None and Ship.conf is None:
             cfg = Config()
+            Ship._zenoh = Zenoh.open(cfg)
+        elif Ship._zenoh is None:
+            cfg = Ship.conf
             Ship._zenoh = Zenoh.open(cfg)
         return Ship._zenoh
 
     def __init__(
         self,
+        conf,
         name="MASS_0",
         controller_id=1,
         latitude=30.0,
@@ -102,8 +109,10 @@ class Ship:
         self.decel_rate = max(0.01, min(0.5, 5000 / (self.tonnage + 1)))
 
         # Zenoh init
+        self.conf = conf
         self.zenoh = Ship.init_zenoh()
         self._start_zenoh_subscribers()
+
 
         # Safety gates
         self.safety_gates = []
@@ -692,7 +701,62 @@ class Ship:
 # MAIN ENTRY POINT
 # ---------------------------------------------------------------------
 if __name__ == "__main__":
-    ship = Ship(name="MASS_0", controller_id=1)
+    parser = argparse.ArgumentParser(
+        prog="Zenoh ship simulator",
+        description="A lightweight ship simulator built on Zenoh, using the Keelson messaging architecture",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    parser.add_argument("--log-level", type=int, default=logging.INFO)
+
+    parser.add_argument(
+        "--mode",
+        "-m",
+        dest="mode",
+        choices=["peer", "client"],
+        type=str,
+        help="The zenoh session mode.",
+    )
+
+    parser.add_argument(
+        "--connect",
+        action="append",
+        type=str,
+        help="Endpoints to connect to, in case multicast is not working. ex. tcp/localhost:7447",
+    )
+
+    parser.add_argument(
+        "--query",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Query router storage for keys before subscribing to them",
+    )
+
+    parser.add_argument(
+        "--show-frequencies",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Query router storage for keys before subscribing to them",
+    )
+    # Parse arguments and start doing our thing
+    args = parser.parse_args()
+
+    # Setup logger
+    logging.basicConfig(
+        format="%(asctime)s %(levelname)s %(name)s %(message)s", level=args.log_level
+    )
+    logging.captureWarnings(True)
+
+    # Put together zenoh session configuration
+    conf = Config()
+
+    if args.mode is not None:
+        conf.insert_json5("mode", json.dumps(args.mode))
+    if args.connect is not None:
+        conf.insert_json5("connect/endpoints", json.dumps(args.connect))
+    
+    ship = Ship(name="MASS_0", controller_id=1, conf=conf)
+
 
     ship.cog_deg = 45.0
     ship.sog_knots = 15.0
